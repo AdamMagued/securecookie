@@ -9,16 +9,19 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	fuzz "github.com/google/gofuzz"
 )
 
-// Asserts that cookieError and MultiError are Error implementations.
+// Asserts that cookieError, cookieLengthError, and MultiError are Error implementations.
 var _ Error = cookieError{}
+var _ Error = cookieLengthError{}
 var _ Error = MultiError{}
 
 var testCookies = []interface{}{
@@ -29,7 +32,6 @@ var testCookies = []interface{}{
 var testStrings = []string{"foo", "bar", "baz"}
 
 func TestSecureCookie(t *testing.T) {
-	// TODO test too old / too new timestamps
 	s1 := New([]byte("12345"), []byte("1234567890123456"))
 	s2 := New([]byte("54321"), []byte("6543210987654321"))
 	value := map[string]interface{}{
@@ -341,4 +343,250 @@ func FuzzEncodeDecode(f *testing.F) {
 			t.Fatalf("Expected %v, got %v.", s, dc)
 		}
 	})
+}
+
+func TestTimestampExpired(t *testing.T) {
+	s := New([]byte("hash-key-12345678901234567890123"), nil)
+	s.MaxAge(3600)
+
+	now := time.Now().UTC().Unix()
+	s.timeFunc = func() int64 { return now }
+
+	encoded, err := s.Encode("test_cookie", "hello")
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	var dst string
+	if err := s.Decode("test_cookie", encoded, &dst); err != nil {
+		t.Fatalf("Decode failed at valid time: %v", err)
+	}
+
+	s.timeFunc = func() int64 { return now + 3601 }
+	err = s.Decode("test_cookie", encoded, &dst)
+	if err == nil {
+		t.Fatal("Expected error for expired cookie, got nil")
+	}
+
+	if !errors.Is(err, ErrTimestampExpired) {
+		t.Fatalf("Expected errors.Is(err, ErrTimestampExpired), got %v", err)
+	}
+	if !IsTimestampExpired(err) {
+		t.Fatalf("Expected IsTimestampExpired(err) == true, got %v", err)
+	}
+	if errors.Is(err, ErrMacInvalid) {
+		t.Fatalf("Expected !errors.Is(err, ErrMacInvalid), got true")
+	}
+	if IsMacInvalid(err) {
+		t.Fatalf("Expected IsMacInvalid(err) == false, got true")
+	}
+	scErr, ok := err.(Error)
+	if !ok || !scErr.IsDecode() {
+		t.Fatalf("Expected decode error, got %v", err)
+	}
+}
+
+func TestTimestampTooNew(t *testing.T) {
+	s := New([]byte("hash-key-12345678901234567890123"), nil)
+	s.MinAge(60)
+
+	now := time.Now().UTC().Unix()
+	s.timeFunc = func() int64 { return now }
+
+	encoded, err := s.Encode("test_cookie", "hello")
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	var dst string
+	s.timeFunc = func() int64 { return now + 30 }
+	err = s.Decode("test_cookie", encoded, &dst)
+	if err == nil {
+		t.Fatal("Expected error for too new cookie, got nil")
+	}
+
+	if !errors.Is(err, ErrTimestampTooNew) {
+		t.Fatalf("Expected errors.Is(err, ErrTimestampTooNew), got %v", err)
+	}
+	if !IsTimestampTooNew(err) {
+		t.Fatalf("Expected IsTimestampTooNew(err) == true, got %v", err)
+	}
+	if errors.Is(err, ErrTimestampExpired) {
+		t.Fatalf("Expected !errors.Is(err, ErrTimestampExpired), got true")
+	}
+	if IsTimestampExpired(err) {
+		t.Fatalf("Expected IsTimestampExpired(err) == false, got true")
+	}
+	scErr, ok := err.(Error)
+	if !ok || !scErr.IsDecode() {
+		t.Fatalf("Expected decode error, got %v", err)
+	}
+
+	s.timeFunc = func() int64 { return now + 65 }
+	if err := s.Decode("test_cookie", encoded, &dst); err != nil {
+		t.Fatalf("Decode failed after MinAge: %v", err)
+	}
+}
+
+func TestMacInvalid(t *testing.T) {
+	s := New([]byte("hash-key-12345678901234567890123"), nil)
+	encoded, err := s.Encode("test_cookie", "hello")
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	raw, err := base64.URLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("DecodeString failed: %v", err)
+	}
+	raw[len(raw)-1] ^= 0x01
+	tampered := base64.URLEncoding.EncodeToString(raw)
+
+	var dst string
+	err = s.Decode("test_cookie", tampered, &dst)
+	if err == nil {
+		t.Fatal("Expected error for tampered cookie, got nil")
+	}
+
+	if !errors.Is(err, ErrMacInvalid) {
+		t.Fatalf("Expected errors.Is(err, ErrMacInvalid), got %v", err)
+	}
+	if !IsMacInvalid(err) {
+		t.Fatalf("Expected IsMacInvalid(err) == true, got %v", err)
+	}
+	if errors.Is(err, ErrTimestampExpired) {
+		t.Fatalf("Expected !errors.Is(err, ErrTimestampExpired), got true")
+	}
+	if IsTimestampExpired(err) {
+		t.Fatalf("Expected IsTimestampExpired(err) == false, got true")
+	}
+}
+
+func TestLengthErrors(t *testing.T) {
+	s := New([]byte("hash-key-12345678901234567890123"), nil)
+	s.MaxLength(20)
+
+	_, err := s.Encode("test_cookie", "a very long cookie value exceeding max length limit")
+	if err == nil {
+		t.Fatal("Expected error when encoded value exceeds MaxLength")
+	}
+	if !errors.Is(err, ErrEncodedValueTooLong) {
+		t.Fatalf("Expected errors.Is(err, ErrEncodedValueTooLong), got %v", err)
+	}
+	scErr, ok := err.(Error)
+	if !ok || !scErr.IsUsage() {
+		t.Fatalf("Expected usage error for ErrEncodedValueTooLong, got %v", err)
+	}
+
+	var dst string
+	err = s.Decode("test_cookie", "this-value-is-longer-than-twenty-characters", &dst)
+	if err == nil {
+		t.Fatal("Expected error when value to decode exceeds MaxLength")
+	}
+	if !errors.Is(err, ErrValueToDecodeTooLong) {
+		t.Fatalf("Expected errors.Is(err, ErrValueToDecodeTooLong), got %v", err)
+	}
+	if errors.Is(err, ErrEncodedValueTooLong) {
+		t.Fatalf("Expected !errors.Is(err, ErrEncodedValueTooLong), got true")
+	}
+	scErr, ok = err.(Error)
+	if !ok || !scErr.IsDecode() {
+		t.Fatalf("Expected decode error for ErrValueToDecodeTooLong, got %v", err)
+	}
+}
+
+func TestMultiErrorMatching(t *testing.T) {
+	s1 := New([]byte("hash-key-1-123456789012345678901"), nil)
+	s2 := New([]byte("hash-key-2-123456789012345678901"), nil)
+	s1.MaxAge(10)
+
+	now := time.Now().UTC().Unix()
+	s1.timeFunc = func() int64 { return now }
+	encoded, err := s1.Encode("test_cookie", "secret-payload")
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	s1.timeFunc = func() int64 { return now + 100 }
+	var dst string
+	err = DecodeMulti("test_cookie", encoded, &dst, s1, s2)
+	if err == nil {
+		t.Fatal("Expected error from DecodeMulti")
+	}
+
+	if !errors.Is(err, ErrTimestampExpired) {
+		t.Fatalf("Expected MultiError to match ErrTimestampExpired")
+	}
+	if !IsTimestampExpired(err) {
+		t.Fatalf("Expected IsTimestampExpired(err) == true on MultiError")
+	}
+	if !errors.Is(err, ErrMacInvalid) {
+		t.Fatalf("Expected MultiError to match ErrMacInvalid")
+	}
+	if !IsMacInvalid(err) {
+		t.Fatalf("Expected IsMacInvalid(err) == true on MultiError")
+	}
+	if errors.Is(err, ErrHashKeyNotSet) {
+		t.Fatalf("Expected MultiError not to match ErrHashKeyNotSet")
+	}
+
+	var multiErr MultiError
+	if !errors.As(err, &multiErr) {
+		t.Fatalf("Expected errors.As to match MultiError")
+	}
+	if len(multiErr) != 2 {
+		t.Fatalf("Expected 2 errors in MultiError, got %d", len(multiErr))
+	}
+
+	unwrapped := multiErr.Unwrap()
+	if len(unwrapped) != 2 {
+		t.Fatalf("Expected Unwrap to return 2 errors, got %d", len(unwrapped))
+	}
+}
+
+func TestSentinelErrorsMatching(t *testing.T) {
+	sNoHash := New(nil, nil)
+	var dst string
+	err := sNoHash.Decode("test", "dummy", &dst)
+	if !errors.Is(err, ErrHashKeyNotSet) {
+		t.Fatalf("Expected ErrHashKeyNotSet, got %v", err)
+	}
+
+	sNoBlock := New([]byte("hash-key"), nil)
+	sNoBlock.BlockFunc(aes.NewCipher)
+	_, err = sNoBlock.Encode("test", "data")
+	if !errors.Is(err, ErrBlockKeyNotSet) {
+		t.Fatalf("Expected ErrBlockKeyNotSet, got %v", err)
+	}
+
+	_, err = EncodeMulti("test", "data")
+	if !errors.Is(err, ErrNoCodecs) {
+		t.Fatalf("Expected ErrNoCodecs on EncodeMulti, got %v", err)
+	}
+	err = DecodeMulti("test", "data", &dst)
+	if !errors.Is(err, ErrNoCodecs) {
+		t.Fatalf("Expected ErrNoCodecs on DecodeMulti, got %v", err)
+	}
+
+	sValid := New([]byte("hash-key-12345678901234567890123"), nil)
+	err = sValid.Decode("test", "%%%invalid-base64%%%", &dst)
+	if !errors.Is(err, ErrBadBase64) {
+		t.Fatalf("Expected ErrBadBase64 on invalid base64, got %v", err)
+	}
+}
+
+func TestCookieErrorUnwrap(t *testing.T) {
+	underlying := errors.New("underlying cause")
+	wrapped := cookieError{
+		typ:   decodeError,
+		msg:   "failed to deserialize",
+		cause: underlying,
+	}
+
+	if !errors.Is(wrapped, underlying) {
+		t.Fatalf("Expected errors.Is to unwrap to underlying cause")
+	}
+	if errors.Unwrap(wrapped) != underlying {
+		t.Fatalf("Expected errors.Unwrap to return underlying cause")
+	}
 }

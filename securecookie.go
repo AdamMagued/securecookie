@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -75,6 +76,21 @@ func (e cookieError) IsInternal() bool { return (e.typ & internalError) != 0 }
 
 func (e cookieError) Cause() error { return e.cause }
 
+// Unwrap returns the underlying cause of this error, if any.
+func (e cookieError) Unwrap() error { return e.cause }
+
+// Is reports whether this error matches target.
+func (e cookieError) Is(target error) bool {
+	t, ok := target.(cookieError)
+	if !ok {
+		return false
+	}
+	if e.msg != "" && e.msg == t.msg && e.typ == t.typ {
+		return true
+	}
+	return e == t
+}
+
 func (e cookieError) Error() string {
 	parts := []string{"securecookie: "}
 	if e.msg == "" {
@@ -88,29 +104,82 @@ func (e cookieError) Error() string {
 	return strings.Join(parts, "")
 }
 
+type cookieLengthError struct {
+	cookieError
+	length int
+}
+
+func (e cookieLengthError) Error() string {
+	return fmt.Sprintf("%s: %d", e.cookieError.Error(), e.length)
+}
+
+func (e cookieLengthError) Unwrap() error {
+	return e.cookieError
+}
+
 var (
-	errGeneratingIV = cookieError{typ: internalError, msg: "failed to generate random iv"}
+	// ErrGeneratingIV indicates that random IV generation failed during encryption.
+	ErrGeneratingIV = cookieError{typ: internalError, msg: "failed to generate random iv"}
 
-	errNoCodecs            = cookieError{typ: usageError, msg: "no codecs provided"}
-	errHashKeyNotSet       = cookieError{typ: usageError, msg: "hash key is not set"}
-	errBlockKeyNotSet      = cookieError{typ: usageError, msg: "block key is not set"}
-	errEncodedValueTooLong = cookieError{typ: usageError, msg: "the value is too long"}
+	// ErrNoCodecs indicates that no codecs were provided to EncodeMulti or DecodeMulti.
+	ErrNoCodecs = cookieError{typ: usageError, msg: "no codecs provided"}
+	// ErrHashKeyNotSet indicates that the hash key was not configured.
+	ErrHashKeyNotSet = cookieError{typ: usageError, msg: "hash key is not set"}
+	// ErrBlockKeyNotSet indicates that the block key was not configured.
+	ErrBlockKeyNotSet = cookieError{typ: usageError, msg: "block key is not set"}
+	// ErrEncodedValueTooLong indicates that the encoded cookie value exceeds MaxLength.
+	ErrEncodedValueTooLong = cookieError{typ: usageError, msg: "the value is too long"}
 
-	errValueToDecodeTooLong = cookieError{typ: decodeError, msg: "the value is too long"}
-	errTimestampInvalid     = cookieError{typ: decodeError, msg: "invalid timestamp"}
-	errTimestampTooNew      = cookieError{typ: decodeError, msg: "timestamp is too new"}
-	errTimestampExpired     = cookieError{typ: decodeError, msg: "expired timestamp"}
-	errDecryptionFailed     = cookieError{typ: decodeError, msg: "the value could not be decrypted"}
-	errValueNotByte         = cookieError{typ: decodeError, msg: "value not a []byte."}
-	errValueNotBytePtr      = cookieError{typ: decodeError, msg: "value not a pointer to []byte."}
+	// ErrValueToDecodeTooLong indicates that the cookie value to decode exceeds MaxLength.
+	ErrValueToDecodeTooLong = cookieError{typ: decodeError, msg: "the value is too long"}
+	// ErrTimestampInvalid indicates that the cookie timestamp could not be parsed.
+	ErrTimestampInvalid = cookieError{typ: decodeError, msg: "invalid timestamp"}
+	// ErrTimestampTooNew indicates that the cookie timestamp is newer than MinAge allows.
+	ErrTimestampTooNew = cookieError{typ: decodeError, msg: "timestamp is too new"}
+	// ErrTimestampExpired indicates that the cookie timestamp is older than MaxAge allows.
+	ErrTimestampExpired = cookieError{typ: decodeError, msg: "expired timestamp"}
+	// ErrDecryptionFailed indicates that the encrypted cookie payload could not be decrypted.
+	ErrDecryptionFailed = cookieError{typ: decodeError, msg: "the value could not be decrypted"}
+	// ErrBadBase64 indicates that base64 decoding of the cookie value failed.
+	ErrBadBase64 = cookieError{typ: decodeError, msg: "base64 decode failed"}
+	// ErrValueNotByte indicates that NopEncoder.Serialize was passed a value that is not a []byte.
+	ErrValueNotByte = cookieError{typ: decodeError, msg: "value not a []byte."}
+	// ErrValueNotBytePtr indicates that NopEncoder.Deserialize was passed a destination that is not a pointer to []byte.
+	ErrValueNotBytePtr = cookieError{typ: decodeError, msg: "value not a pointer to []byte."}
 
 	// ErrMacInvalid indicates that cookie decoding failed because the HMAC
-	// could not be extracted and verified.  Direct use of this error
-	// variable is deprecated; it is public only for legacy compatibility,
-	// and may be privatized in the future, as it is rarely useful to
-	// distinguish between this error and other Error implementations.
+	// could not be extracted and verified.
 	ErrMacInvalid = cookieError{typ: decodeError, msg: "the value is not valid"}
+
+	errGeneratingIV         = ErrGeneratingIV
+	errNoCodecs             = ErrNoCodecs
+	errHashKeyNotSet        = ErrHashKeyNotSet
+	errBlockKeyNotSet       = ErrBlockKeyNotSet
+	errEncodedValueTooLong  = ErrEncodedValueTooLong
+	errValueToDecodeTooLong = ErrValueToDecodeTooLong
+	errTimestampInvalid     = ErrTimestampInvalid
+	errTimestampTooNew      = ErrTimestampTooNew
+	errTimestampExpired     = ErrTimestampExpired
+	errDecryptionFailed     = ErrDecryptionFailed
+	errBadBase64            = ErrBadBase64
+	errValueNotByte         = ErrValueNotByte
+	errValueNotBytePtr      = ErrValueNotBytePtr
 )
+
+// IsMacInvalid reports whether err was caused by an invalid HMAC.
+func IsMacInvalid(err error) bool {
+	return errors.Is(err, ErrMacInvalid)
+}
+
+// IsTimestampExpired reports whether err was caused by an expired timestamp.
+func IsTimestampExpired(err error) bool {
+	return errors.Is(err, ErrTimestampExpired)
+}
+
+// IsTimestampTooNew reports whether err was caused by a timestamp that is too new.
+func IsTimestampTooNew(err error) bool {
+	return errors.Is(err, ErrTimestampTooNew)
+}
 
 // Codec defines an interface to encode and decode cookie values.
 type Codec interface {
@@ -286,7 +355,7 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 	b = encode(b)
 	// 5. Check length.
 	if s.maxLength != 0 && len(b) > s.maxLength {
-		return "", fmt.Errorf("%s: %d", errEncodedValueTooLong, len(b))
+		return "", cookieLengthError{cookieError: ErrEncodedValueTooLong, length: len(b)}
 	}
 	// Done.
 	return string(b), nil
@@ -310,7 +379,7 @@ func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
 	}
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
-		return fmt.Errorf("%s: %d", errValueToDecodeTooLong, len(value))
+		return cookieLengthError{cookieError: ErrValueToDecodeTooLong, length: len(value)}
 	}
 	// 2. Decode from base64.
 	b, err := decode([]byte(value))
@@ -496,7 +565,7 @@ func decode(value []byte) ([]byte, error) {
 	decoded := make([]byte, base64.URLEncoding.DecodedLen(len(value)))
 	b, err := base64.URLEncoding.Decode(decoded, value)
 	if err != nil {
-		return nil, cookieError{cause: err, typ: decodeError, msg: "base64 decode failed"}
+		return nil, cookieError{cause: err, typ: decodeError, msg: ErrBadBase64.msg}
 	}
 	return decoded[:b], nil
 }
@@ -564,18 +633,18 @@ func CodecsFromPairs(keyPairs ...[]byte) []Codec {
 // On error, may return a MultiError.
 func EncodeMulti(name string, value interface{}, codecs ...Codec) (string, error) {
 	if len(codecs) == 0 {
-		return "", errNoCodecs
+		return "", ErrNoCodecs
 	}
 
-	var errors MultiError
+	var errs MultiError
 	for _, codec := range codecs {
 		encoded, err := codec.Encode(name, value)
 		if err == nil {
 			return encoded, nil
 		}
-		errors = append(errors, err)
+		errs = append(errs, err)
 	}
-	return "", errors
+	return "", errs
 }
 
 // DecodeMulti decodes a cookie value using a group of codecs.
@@ -586,18 +655,18 @@ func EncodeMulti(name string, value interface{}, codecs ...Codec) (string, error
 // On error, may return a MultiError.
 func DecodeMulti(name string, value string, dst interface{}, codecs ...Codec) error {
 	if len(codecs) == 0 {
-		return errNoCodecs
+		return ErrNoCodecs
 	}
 
-	var errors MultiError
+	var errs MultiError
 	for _, codec := range codecs {
 		err := codec.Decode(name, value, dst)
 		if err == nil {
 			return nil
 		}
-		errors = append(errors, err)
+		errs = append(errs, err)
 	}
-	return errors
+	return errs
 }
 
 // MultiError groups multiple errors.
@@ -616,6 +685,31 @@ func (m MultiError) IsInternal() bool { return m.any(func(e Error) bool { return
 // provide this functionality.  Clients which really wish to access the Causes
 // of the underlying errors are free to iterate through the errors themselves.
 func (m MultiError) Cause() error { return nil }
+
+// Unwrap returns the underlying slice of errors.
+func (m MultiError) Unwrap() []error {
+	return []error(m)
+}
+
+// Is reports whether any error in m matches target according to errors.Is.
+func (m MultiError) Is(target error) bool {
+	for _, e := range m {
+		if e != nil && errors.Is(e, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// As finds the first error in m that matches target according to errors.As.
+func (m MultiError) As(target interface{}) bool {
+	for _, e := range m {
+		if e != nil && errors.As(e, target) {
+			return true
+		}
+	}
+	return false
+}
 
 func (m MultiError) Error() string {
 	s, n := "", 0
